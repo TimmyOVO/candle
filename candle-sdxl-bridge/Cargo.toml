@@ -1,0 +1,29 @@
+[package]
+name = "candle-sdxl-bridge"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = { workspace = true }
+candle = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokenizers = { workspace = true, features = ["onig"] }
+
+[features]
+default = []
+metal = [
+    "candle/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+]
