@@ -1,0 +1,4 @@
+module CandleSDXL [system] {
+	header "candle_sdxl_bridge.h"
+	export *
+}
