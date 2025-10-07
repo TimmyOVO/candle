@@ -15,6 +15,21 @@ typedef enum candle_sdxlCandleSdxlStatusCode {
   NotInitialized = 2,
   AlreadyInitialized = 3,
   RuntimeError = 4,
+  AssetDirInvalid = 5,
+  AssetRootMissing = 6,
+  AssetTokenizerPrimaryMissing = 7,
+  AssetTokenizerSecondaryMissing = 8,
+  AssetClipPrimaryMissing = 9,
+  AssetClipSecondaryMissing = 10,
+  AssetUnetMissing = 11,
+  AssetVaeMissing = 12,
+  LoadTokenizerPrimaryFailed = 13,
+  LoadTokenizerSecondaryFailed = 14,
+  LoadClipPrimaryFailed = 15,
+  LoadClipSecondaryFailed = 16,
+  LoadUnetFailed = 17,
+  LoadVaeFailed = 18,
+  MetalUnavailable = 19,
 } candle_sdxlCandleSdxlStatusCode;
 
 typedef struct candle_sdxlCandleSdxlInitOptions {
