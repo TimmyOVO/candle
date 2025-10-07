@@ -186,6 +186,7 @@ pub unsafe extern "C" fn candle_sd15_generate(
     request: *const CandleSd15Request,
     out_image: *mut CandleSd15Image,
 ) -> CandleSd15StatusCode {
+    log_process_memory("candle_sd15_generate");
     if request.is_null() {
         return set_error(
             CandleSd15StatusCode::InvalidArgument,
@@ -232,6 +233,8 @@ pub unsafe extern "C" fn candle_sd15_generate(
     } else {
         None
     };
+
+    log_process_memory("args parsed");
 
     let mut guard = context.lock().expect("mutex poisoned");
     match generate_image(&mut guard, &prompt, &negative_prompt, steps, seed) {
@@ -356,21 +359,26 @@ fn generate_image(
     steps: usize,
     seed: Option<u64>,
 ) -> anyhow::Result<Vec<u8>> {
+    log_process_memory("generate_image");
     let mut scheduler = context.config.build_scheduler(steps)?;
     let text_embeddings = build_text_embeddings(context, prompt, negative_prompt)?;
     let use_guidance = GUIDANCE_SCALE > 1.0;
+    log_process_memory("embeddings computed");
 
     let latent_shape = (1, 4, context.config.height / 8, context.config.width / 8);
     let mut latents = sample_latents(latent_shape, &context.device, context.dtype, seed)?;
     latents = (latents * scheduler.init_noise_sigma())?.to_dtype(context.dtype)?;
+    log_process_memory("latents initialised");
 
     let timesteps = scheduler.timesteps().to_vec();
-    for &timestep in &timesteps {
+    for (step_idx, &timestep) in timesteps.iter().enumerate() {
+        log_process_memory(format!("unet step {}/{steps} begin", step_idx + 1).as_str());
         let mut latent_model_input = latents.clone();
         if use_guidance {
             latent_model_input = Tensor::cat(&[&latent_model_input, &latent_model_input], 0)?;
         }
         latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)?;
+        log_process_memory("latent input scaled");
 
         let noise_pred =
             context
@@ -385,14 +393,20 @@ fn generate_image(
             noise_pred
         };
 
+        log_process_memory("noise_pred computed");
+
         latents = scheduler
             .step(&noise_pred, timestep, &latents)?
             .to_dtype(context.dtype)?;
+        log_process_memory(format!("unet step {}/{steps} END", step_idx + 1).as_str());
     }
+    log_process_memory("unet completed");
 
     let latents = (latents / 0.18215)?; // standard SD15 VAE scale
+    log_process_memory("vae decode start");
     let image = context.vae.decode(&latents)?;
     let image = ((image / 2.)? + 0.5)?.to_device(&Device::Cpu)?;
+    log_process_memory("vae decoded");
     let image = (image.clamp(0f32, 1.)? * 255.)?.to_dtype(DType::U8)?;
     let image = image.i(0)?;
     let image = image.permute((1, 2, 0))?.flatten_all()?;
@@ -497,6 +511,40 @@ fn sample_latents(
     } else {
         let tensor = Tensor::randn(0f32, 1f32, shape, device)?;
         Ok(tensor.to_dtype(dtype)?)
+    }
+}
+
+fn log_process_memory(stage: &str) {
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    unsafe {
+        use libc::{mach_msg_type_number_t, mach_task_basic_info};
+        use libc::{task_info, KERN_SUCCESS, MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT};
+
+        let mut info = std::mem::zeroed::<mach_task_basic_info>();
+        let mut count: mach_msg_type_number_t = MACH_TASK_BASIC_INFO_COUNT;
+
+        #[allow(deprecated)]
+        let task = libc::mach_task_self();
+
+        let result = task_info(
+            task,
+            MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as *mut i32,
+            &mut count,
+        );
+
+        if result == KERN_SUCCESS {
+            println!(
+                "[sd15][{stage}] resident={} MB, virtual={} MB",
+                info.resident_size / 1024 / 1024,
+                info.virtual_size / 1024 / 1024
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+    {
+        println!("[sd15][{stage}] (process stats not available on this platform)");
     }
 }
 
