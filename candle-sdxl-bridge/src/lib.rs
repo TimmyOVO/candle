@@ -10,6 +10,9 @@ use candle_transformers::models::stable_diffusion;
 use candle_transformers::models::stable_diffusion::clip;
 use candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
 const HEIGHT: usize = 512;
@@ -186,7 +189,12 @@ pub unsafe extern "C" fn candle_sdxl_init(
     let options = &*options;
     let asset_dir = match c_string_to_path(options.asset_dir) {
         Ok(path) => path,
-        Err(_code) => return set_error(CandleSdxlStatusCode::AssetDirInvalid, "invalid asset_dir path"),
+        Err(_code) => {
+            return set_error(
+                CandleSdxlStatusCode::AssetDirInvalid,
+                "invalid asset_dir path",
+            )
+        }
     };
     let use_metal = options.use_metal != 0;
 
@@ -318,7 +326,12 @@ fn initialise(asset_dir: &Path, use_metal: bool) -> Result<SdxlBridge, CandleSdx
         Device::Cpu
     };
 
-    let dtype = DType::F16;
+    // Mixed precision: UNet in F16 (on Metal) for perf, VAE in F32 for stability
+    let (unet_dtype, vae_dtype) = if use_metal {
+        (DType::F16, DType::F32)
+    } else {
+        (DType::F32, DType::F32)
+    };
     let config =
         stable_diffusion::StableDiffusionConfig::sdxl_turbo(None, Some(HEIGHT), Some(WIDTH));
 
@@ -327,7 +340,12 @@ fn initialise(asset_dir: &Path, use_metal: bool) -> Result<SdxlBridge, CandleSdx
         .with_context(|| format!("failed to load tokenizer at {:?}", layout.tokenizer_primary))
     {
         Ok(v) => v,
-        Err(e) => return Err(set_error(CandleSdxlStatusCode::LoadTokenizerPrimaryFailed, e)),
+        Err(e) => {
+            return Err(set_error(
+                CandleSdxlStatusCode::LoadTokenizerPrimaryFailed,
+                e,
+            ))
+        }
     };
     let tokenizer_secondary = match Tokenizer::from_file(&layout.tokenizer_secondary)
         .map_err(anyhow::Error::msg)
@@ -338,7 +356,12 @@ fn initialise(asset_dir: &Path, use_metal: bool) -> Result<SdxlBridge, CandleSdx
             )
         }) {
         Ok(v) => v,
-        Err(e) => return Err(set_error(CandleSdxlStatusCode::LoadTokenizerSecondaryFailed, e)),
+        Err(e) => {
+            return Err(set_error(
+                CandleSdxlStatusCode::LoadTokenizerSecondaryFailed,
+                e,
+            ))
+        }
     };
 
     let clip_primary = match stable_diffusion::build_clip_transformer(
@@ -369,18 +392,18 @@ fn initialise(asset_dir: &Path, use_metal: bool) -> Result<SdxlBridge, CandleSdx
         Err(e) => return Err(set_error(CandleSdxlStatusCode::LoadClipSecondaryFailed, e)),
     };
 
-    let vae = match config.build_vae(&layout.vae, &device, dtype) {
+    let vae = match config.build_vae(&layout.vae, &device, vae_dtype) {
         Ok(v) => v,
         Err(e) => return Err(set_error(CandleSdxlStatusCode::LoadVaeFailed, e)),
     };
-    let unet = match config.build_unet(&layout.unet, &device, 4, false, dtype) {
+    let unet = match config.build_unet(&layout.unet, &device, 4, false, unet_dtype) {
         Ok(v) => v,
         Err(e) => return Err(set_error(CandleSdxlStatusCode::LoadUnetFailed, e)),
     };
 
     Ok(SdxlBridge {
         device,
-        dtype,
+        dtype: unet_dtype,
         config,
         tokenizer_primary,
         tokenizer_secondary,
@@ -397,19 +420,11 @@ fn generate_image(
     steps: usize,
     seed: Option<u64>,
 ) -> anyhow::Result<Vec<u8>> {
-    if let Some(seed) = seed {
-        context.device.set_seed(seed)?;
-    }
-
     let mut scheduler = context.config.build_scheduler(steps)?;
     let text_embeddings = build_text_embeddings(context, prompt)?;
 
-    let mut latents = Tensor::randn(
-        0f32,
-        1f32,
-        (1, 4, context.config.height / 8, context.config.width / 8),
-        &context.device,
-    )?;
+    let latent_shape = (1, 4, context.config.height / 8, context.config.width / 8);
+    let mut latents = sample_latents(latent_shape, &context.device, context.dtype, seed)?;
     latents = (latents * scheduler.init_noise_sigma())?.to_dtype(context.dtype)?;
 
     let timesteps = scheduler.timesteps().to_vec();
@@ -424,13 +439,18 @@ fn generate_image(
             .to_dtype(context.dtype)?;
     }
 
-    let latents = (latents / VAE_SCALE)?;
+    let latents = (latents / VAE_SCALE)?.to_dtype(DType::F32)?;
     let image = context.vae.decode(&latents)?;
     let image = ((image / 2.)? + 0.5)?.to_device(&Device::Cpu)?;
     let image = (image.clamp(0f32, 1.)? * 255.)?.to_dtype(DType::U8)?;
     let image = image.i(0)?; // (3, H, W)
     let image = image.permute((1, 2, 0))?.flatten_all()?;
     let rgb = image.to_vec1::<u8>()?;
+    #[cfg(debug_assertions)]
+    {
+        let non_zero = rgb.iter().filter(|v| **v != 0).count();
+        println!("DEBUG: rgb bytes non-zero {}/{}", non_zero, rgb.len());
+    }
     Ok(to_rgba(&rgb))
 }
 
@@ -507,6 +527,30 @@ fn to_rgba(rgb: &[u8]) -> Vec<u8> {
         rgba.push(255);
     }
     rgba
+}
+
+fn sample_latents(
+    shape: (usize, usize, usize, usize),
+    device: &Device,
+    dtype: DType,
+    seed: Option<u64>,
+) -> anyhow::Result<Tensor> {
+    if let Some(seed) = seed {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let normal = StandardNormal;
+        let elem = shape.0 * shape.1 * shape.2 * shape.3;
+        let mut data = vec![0f32; elem];
+        for value in &mut data {
+            *value = normal.sample(&mut rng);
+        }
+        let tensor = Tensor::from_vec(data, shape, &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(device)?;
+        Ok(tensor)
+    } else {
+        let tensor = Tensor::randn(0f32, 1f32, shape, device)?;
+        Ok(tensor.to_dtype(dtype)?)
+    }
 }
 
 fn c_string_to_path(ptr: *const c_char) -> Result<PathBuf, CandleSdxlStatusCode> {
