@@ -15,8 +15,8 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
-const HEIGHT: usize = 256;  //512;
-const WIDTH: usize = 256;   //512;
+const HEIGHT: usize = 400;  //512;
+const WIDTH: usize = 400;   //512;
 const GUIDANCE_SCALE: f64 = 7.5;
 const NEGATIVE_PROMPT_DEFAULT: &str = "";
 
@@ -308,7 +308,7 @@ fn initialise(asset_dir: &Path, use_metal: bool) -> Result<Sd15Bridge, CandleSd1
         (DType::F32, DType::F32)
     } else {
         // (DType::F16, DType::F32)
-        (DType::F32, DType::F32)
+        (DType::F16, DType::F32)
     };
     let config = stable_diffusion::StableDiffusionConfig::v1_5(None, Some(HEIGHT), Some(WIDTH));
 
@@ -381,6 +381,7 @@ fn generate_image(
             .step(&noise_pred, timestep, &latents)?
             .to_dtype(context.unet_dtype)?;
         log_process_memory(format!("unet step {}/{steps} END", step_idx + 1).as_str());
+        drop(noise_pred);
     }
     log_process_memory("unet completed");
     drop(unet);
@@ -388,7 +389,7 @@ fn generate_image(
     drop(text_embeddings);
 
     context.device.synchronize().ok();
-    let latents = (latents / 0.18215)?; // standard SD15 VAE scale
+    let latents = (latents / 0.18215)?.to_dtype(context.vae_dtype)?;
     log_process_memory("vae decode start");
     let vae = context.load_vae()?;
     let image = vae.decode(&latents)?;
