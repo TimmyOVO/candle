@@ -15,8 +15,8 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
-const HEIGHT: usize = 512;
-const WIDTH: usize = 512;
+const HEIGHT: usize = 256;  //512;
+const WIDTH: usize = 256;   //512;
 const GUIDANCE_SCALE: f64 = 7.5;
 const NEGATIVE_PROMPT_DEFAULT: &str = "";
 
@@ -29,12 +29,10 @@ thread_local! {
 
 struct Sd15Bridge {
     device: Device,
-    dtype: DType,
+    unet_dtype: DType,
+    vae_dtype: DType,
     config: stable_diffusion::StableDiffusionConfig,
-    tokenizer: Tokenizer,
-    clip: clip::ClipTextTransformer,
-    unet: UNet2DConditionModel,
-    vae: AutoEncoderKL,
+    layout: AssetLayout,
 }
 
 struct AssetLayout {
@@ -306,49 +304,20 @@ fn initialise(asset_dir: &Path, use_metal: bool) -> Result<Sd15Bridge, CandleSd1
         Device::Cpu
     };
 
-    let dtype = if matches!(device, Device::Cpu) {
-        DType::F32
+    let (unet_dtype, vae_dtype) = if matches!(device, Device::Cpu) {
+        (DType::F32, DType::F32)
     } else {
-        DType::F16
+        // (DType::F16, DType::F32)
+        (DType::F32, DType::F32)
     };
     let config = stable_diffusion::StableDiffusionConfig::v1_5(None, Some(HEIGHT), Some(WIDTH));
 
-    let tokenizer = match Tokenizer::from_file(&layout.tokenizer)
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("failed to load tokenizer at {:?}", layout.tokenizer))
-    {
-        Ok(v) => v,
-        Err(e) => return Err(set_error(CandleSd15StatusCode::LoadTokenizerFailed, e)),
-    };
-
-    let clip = match stable_diffusion::build_clip_transformer(
-        &config.clip,
-        &layout.clip,
-        &device,
-        DType::F32,
-    ) {
-        Ok(v) => v,
-        Err(e) => return Err(set_error(CandleSd15StatusCode::LoadClipFailed, e)),
-    };
-
-    let vae = match config.build_vae(&layout.vae, &device, dtype) {
-        Ok(v) => v,
-        Err(e) => return Err(set_error(CandleSd15StatusCode::LoadVaeFailed, e)),
-    };
-
-    let unet = match config.build_unet(&layout.unet, &device, 4, false, dtype) {
-        Ok(v) => v,
-        Err(e) => return Err(set_error(CandleSd15StatusCode::LoadUnetFailed, e)),
-    };
-
     Ok(Sd15Bridge {
         device,
-        dtype,
+        unet_dtype,
+        vae_dtype,
         config,
-        tokenizer,
-        clip,
-        unet,
-        vae,
+        layout,
     })
 }
 
@@ -366,9 +335,23 @@ fn generate_image(
     log_process_memory("embeddings computed");
 
     let latent_shape = (1, 4, context.config.height / 8, context.config.width / 8);
-    let mut latents = sample_latents(latent_shape, &context.device, context.dtype, seed)?;
-    latents = (latents * scheduler.init_noise_sigma())?.to_dtype(context.dtype)?;
+    let mut latents = sample_latents(latent_shape, &context.device, context.unet_dtype, seed)?;
+    latents = (latents * scheduler.init_noise_sigma())?.to_dtype(context.unet_dtype)?;
     log_process_memory("latents initialised");
+
+    log_process_memory(match &context.device {
+        Device::Cpu => "device cpu",
+        Device::Metal(_) => "device metal",
+        Device::Cuda(_) => "device cuda",
+    });
+    let unet = match context.load_unet() {
+        Ok(u) => u,
+        Err(err) => {
+            log_process_memory(format!("unet load failed: {err:?}").as_str());
+            return Err(err);
+        }
+    };
+    log_process_memory(format!("unet loaded dtype={:?}", context.unet_dtype).as_str());
 
     let timesteps = scheduler.timesteps().to_vec();
     for (step_idx, &timestep) in timesteps.iter().enumerate() {
@@ -380,10 +363,9 @@ fn generate_image(
         latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)?;
         log_process_memory("latent input scaled");
 
-        let noise_pred =
-            context
-                .unet
-                .forward(&latent_model_input, timestep as f64, &text_embeddings)?;
+        // context.device.synchronize().ok();
+        let noise_pred = unet.forward(&latent_model_input, timestep as f64, &text_embeddings)?;
+        // context.device.synchronize().ok();
         let noise_pred = if use_guidance {
             let chunks = noise_pred.chunk(2, 0)?;
             let noise_pred_uncond = &chunks[0];
@@ -397,14 +379,20 @@ fn generate_image(
 
         latents = scheduler
             .step(&noise_pred, timestep, &latents)?
-            .to_dtype(context.dtype)?;
+            .to_dtype(context.unet_dtype)?;
         log_process_memory(format!("unet step {}/{steps} END", step_idx + 1).as_str());
     }
     log_process_memory("unet completed");
+    drop(unet);
+    drop(scheduler);
+    drop(text_embeddings);
 
+    context.device.synchronize().ok();
     let latents = (latents / 0.18215)?; // standard SD15 VAE scale
     log_process_memory("vae decode start");
-    let image = context.vae.decode(&latents)?;
+    let vae = context.load_vae()?;
+    let image = vae.decode(&latents)?;
+    drop(vae);
     let image = ((image / 2.)? + 0.5)?.to_device(&Device::Cpu)?;
     log_process_memory("vae decoded");
     let image = (image.clamp(0f32, 1.)? * 255.)?.to_dtype(DType::U8)?;
@@ -419,16 +407,14 @@ fn build_text_embeddings(
     prompt: &str,
     negative_prompt: &str,
 ) -> anyhow::Result<Tensor> {
-    let prompt_tokens = tokenize_prompt(
-        &context.tokenizer,
-        &context.config.clip,
-        prompt,
-        &context.device,
-    )?;
-    let prompt_embedding = context.clip.forward(&prompt_tokens)?;
+    let tokenizer = context.load_tokenizer()?;
+    let clip = context.load_clip()?;
+
+    let prompt_tokens = tokenize_prompt(&tokenizer, &context.config.clip, prompt, &context.device)?;
+    let prompt_embedding = clip.forward(&prompt_tokens)?;
 
     let negative_tokens = tokenize_prompt(
-        &context.tokenizer,
+        &tokenizer,
         &context.config.clip,
         if negative_prompt.is_empty() {
             NEGATIVE_PROMPT_DEFAULT
@@ -437,11 +423,10 @@ fn build_text_embeddings(
         },
         &context.device,
     )?;
-    let negative_embedding = context.clip.forward(&negative_tokens)?;
+    let negative_embedding = clip.forward(&negative_tokens)?;
 
-    let prompt_embedding = prompt_embedding.to_dtype(context.dtype)?;
-    let negative_embedding = negative_embedding.to_dtype(context.dtype)?;
-    Ok(Tensor::cat(&[&negative_embedding, &prompt_embedding], 0)?)
+    let text_embeddings = Tensor::cat(&[negative_embedding, prompt_embedding], 0)?;
+    Ok(text_embeddings.to_dtype(context.unet_dtype)?)
 }
 
 fn tokenize_prompt(
@@ -545,6 +530,41 @@ fn log_process_memory(stage: &str) {
     #[cfg(not(any(target_os = "ios", target_os = "macos")))]
     {
         println!("[sd15][{stage}] (process stats not available on this platform)");
+    }
+}
+
+impl Sd15Bridge {
+    fn load_tokenizer(&self) -> anyhow::Result<Tokenizer> {
+        // self.device.wait_until_completed().ok();
+        // self.device.synchronize().ok();
+        Tokenizer::from_file(&self.layout.tokenizer)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("failed to load tokenizer at {:?}", self.layout.tokenizer))
+    }
+
+    fn load_clip(&self) -> anyhow::Result<clip::ClipTextTransformer> {
+        // self.device.synchronize().ok();
+        stable_diffusion::build_clip_transformer(
+            &self.config.clip,
+            &self.layout.clip,
+            &self.device,
+            DType::F32,
+        )
+        .with_context(|| format!("failed to load clip weights at {:?}", self.layout.clip))
+    }
+
+    fn load_unet(&self) -> anyhow::Result<UNet2DConditionModel> {
+        // self.device.synchronize().ok();
+        self.config
+            .build_unet(&self.layout.unet, &self.device, 4, false, self.unet_dtype)
+            .with_context(|| format!("failed to load unet at {:?}", self.layout.unet))
+    }
+
+    fn load_vae(&self) -> anyhow::Result<AutoEncoderKL> {
+        // self.device.synchronize().ok();
+        self.config
+            .build_vae(&self.layout.vae, &self.device, self.vae_dtype)
+            .with_context(|| format!("failed to load vae at {:?}", self.layout.vae))
     }
 }
 
