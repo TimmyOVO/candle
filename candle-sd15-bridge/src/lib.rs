@@ -15,8 +15,8 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
-const HEIGHT: usize = 400;  //512;
-const WIDTH: usize = 400;   //512;
+const HEIGHT: usize = 512;  //512;
+const WIDTH: usize = 512;   //512;
 const GUIDANCE_SCALE: f64 = 7.5;
 const NEGATIVE_PROMPT_DEFAULT: &str = "";
 
@@ -232,7 +232,7 @@ pub unsafe extern "C" fn candle_sd15_generate(
         None
     };
 
-    log_process_memory("args parsed");
+    log_process_memory(format!("args parsed, seed {seed:?}").as_str());
 
     let mut guard = context.lock().expect("mutex poisoned");
     match generate_image(&mut guard, &prompt, &negative_prompt, steps, seed) {
@@ -390,8 +390,9 @@ fn generate_image(
 
     context.device.synchronize().ok();
     let latents = (latents / 0.18215)?.to_dtype(context.vae_dtype)?;
-    log_process_memory("vae decode start");
+    log_process_memory("vae will load");
     let vae = context.load_vae()?;
+    log_process_memory("vae did load");
     let image = vae.decode(&latents)?;
     drop(vae);
     let image = ((image / 2.)? + 0.5)?.to_device(&Device::Cpu)?;
@@ -521,8 +522,9 @@ fn log_process_memory(stage: &str) {
 
         if result == KERN_SUCCESS {
             println!(
-                "[sd15][{stage}] resident={} MB, virtual={} MB",
+                "[sd15][{stage}] resident={} MB, resident_max={}, virtual={} MB",
                 info.resident_size / 1024 / 1024,
+                info.resident_size_max / 1024 / 1024,
                 info.virtual_size / 1024 / 1024
             );
         }
