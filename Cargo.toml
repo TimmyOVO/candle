@@ -6,7 +6,6 @@ members = [
     "candle-nn",
     "candle-pyo3",
     "candle-sd15-bridge",
-    "candle-sdxl-bridge",
     "candle-transformers",
     "candle-wasm-examples/*",
     "candle-wasm-tests",
