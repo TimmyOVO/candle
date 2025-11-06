@@ -7,7 +7,7 @@ usize_is_size_t = true
 parse_deps = false
 
 [export]
-prefix = "candle_sd15"
+prefix = ""
 
 [fn]
 rename_args = "None"

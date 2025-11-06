@@ -43,10 +43,10 @@ struct AssetLayout {
 }
 
 impl AssetLayout {
-    fn new(root: PathBuf) -> Result<Self, CandleSd15StatusCode> {
+    fn new(root: PathBuf) -> Result<Self, CandleSdStatusCode> {
         if !root.exists() {
             return Err(set_error(
-                CandleSd15StatusCode::AssetRootMissing,
+                CandleSdStatusCode::AssetRootMissing,
                 format!("asset directory {:?} does not exist", root),
             ));
         }
@@ -58,7 +58,7 @@ impl AssetLayout {
         };
         if !layout.tokenizer.exists() {
             return Err(set_error(
-                CandleSd15StatusCode::AssetTokenizerMissing,
+                CandleSdStatusCode::AssetTokenizerMissing,
                 format!(
                     "missing asset tokenizer/tokenizer.json at {:?}",
                     layout.tokenizer
@@ -67,7 +67,7 @@ impl AssetLayout {
         }
         if !layout.clip.exists() {
             return Err(set_error(
-                CandleSd15StatusCode::AssetClipMissing,
+                CandleSdStatusCode::AssetClipMissing,
                 format!(
                     "missing asset text_encoder/model.fp16.safetensors at {:?}",
                     layout.clip
@@ -76,7 +76,7 @@ impl AssetLayout {
         }
         if !layout.unet.exists() {
             return Err(set_error(
-                CandleSd15StatusCode::AssetUnetMissing,
+                CandleSdStatusCode::AssetUnetMissing,
                 format!(
                     "missing asset unet/diffusion_pytorch_model.fp16.safetensors at {:?}",
                     layout.unet
@@ -85,7 +85,7 @@ impl AssetLayout {
         }
         if !layout.vae.exists() {
             return Err(set_error(
-                CandleSd15StatusCode::AssetVaeMissing,
+                CandleSdStatusCode::AssetVaeMissing,
                 format!(
                     "missing asset vae/diffusion_pytorch_model.fp16.safetensors at {:?}",
                     layout.vae
@@ -97,13 +97,13 @@ impl AssetLayout {
 }
 
 #[repr(C)]
-pub struct CandleSd15InitOptions {
+pub struct CandleSdInitOptions {
     pub asset_dir: *const c_char,
     pub use_metal: u8,
 }
 
 #[repr(C)]
-pub struct CandleSd15Request {
+pub struct CandleSdRequest {
     pub prompt: *const c_char,
     pub negative_prompt: *const c_char,
     pub steps: u32,
@@ -112,7 +112,7 @@ pub struct CandleSd15Request {
 }
 
 #[repr(C)]
-pub struct CandleSd15Image {
+pub struct CandleSdImage {
     pub data: *mut u8,
     pub len: usize,
     pub capacity: usize,
@@ -123,7 +123,7 @@ pub struct CandleSd15Image {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CandleSd15StatusCode {
+pub enum CandleSdStatusCode {
     Ok = 0,
     InvalidArgument = 1,
     NotInitialized = 2,
@@ -143,18 +143,18 @@ pub enum CandleSd15StatusCode {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn candle_sd15_init(
-    options: *const CandleSd15InitOptions,
-) -> CandleSd15StatusCode {
+pub unsafe extern "C" fn candle_sd_init(
+    options: *const CandleSdInitOptions,
+) -> CandleSdStatusCode {
     if options.is_null() {
         return set_error(
-            CandleSd15StatusCode::InvalidArgument,
+            CandleSdStatusCode::InvalidArgument,
             "options pointer was null",
         );
     }
     if CONTEXT.get().is_some() {
         return set_error(
-            CandleSd15StatusCode::AlreadyInitialized,
+            CandleSdStatusCode::AlreadyInitialized,
             "bridge already initialised",
         );
     }
@@ -168,32 +168,32 @@ pub unsafe extern "C" fn candle_sd15_init(
     match initialise(&asset_dir, use_metal) {
         Ok(context) => {
             let _ = CONTEXT.set(Mutex::new(context));
-            CandleSd15StatusCode::Ok
+            CandleSdStatusCode::Ok
         }
         Err(code) => code,
     }
 }
 
 #[no_mangle]
-pub extern "C" fn candle_sd15_is_ready() -> bool {
+pub extern "C" fn candle_sd_is_ready() -> bool {
     CONTEXT.get().is_some()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn candle_sd15_generate(
-    request: *const CandleSd15Request,
-    out_image: *mut CandleSd15Image,
-) -> CandleSd15StatusCode {
-    log_process_memory("candle_sd15_generate");
+pub unsafe extern "C" fn candle_sd_generate(
+    request: *const CandleSdRequest,
+    out_image: *mut CandleSdImage,
+) -> CandleSdStatusCode {
+    log_process_memory("candle_sd_generate");
     if request.is_null() {
         return set_error(
-            CandleSd15StatusCode::InvalidArgument,
+            CandleSdStatusCode::InvalidArgument,
             "request pointer was null",
         );
     }
     if out_image.is_null() {
         return set_error(
-            CandleSd15StatusCode::InvalidArgument,
+            CandleSdStatusCode::InvalidArgument,
             "out_image pointer was null",
         );
     }
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn candle_sd15_generate(
         Some(ctx) => ctx,
         None => {
             return set_error(
-                CandleSd15StatusCode::NotInitialized,
+                CandleSdStatusCode::NotInitialized,
                 "bridge not initialised",
             )
         }
@@ -213,7 +213,7 @@ pub unsafe extern "C" fn candle_sd15_generate(
     };
     if prompt.trim().is_empty() {
         return set_error(
-            CandleSd15StatusCode::InvalidArgument,
+            CandleSdStatusCode::InvalidArgument,
             "prompt must not be empty",
         );
     }
@@ -238,7 +238,7 @@ pub unsafe extern "C" fn candle_sd15_generate(
     match generate_image(&mut guard, &prompt, &negative_prompt, steps, seed) {
         Ok(buffer) => {
             let mut buffer = buffer;
-            let image = CandleSd15Image {
+            let image = CandleSdImage {
                 data: buffer.as_mut_ptr(),
                 len: buffer.len(),
                 capacity: buffer.capacity(),
@@ -248,14 +248,14 @@ pub unsafe extern "C" fn candle_sd15_generate(
             };
             std::mem::forget(buffer);
             *out_image = image;
-            CandleSd15StatusCode::Ok
+            CandleSdStatusCode::Ok
         }
-        Err(err) => set_error(CandleSd15StatusCode::RuntimeError, err),
+        Err(err) => set_error(CandleSdStatusCode::RuntimeError, err),
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn candle_sd15_free_image(image: *mut CandleSd15Image) {
+pub unsafe extern "C" fn candle_sd_free_image(image: *mut CandleSdImage) {
     if image.is_null() {
         return;
     }
@@ -273,7 +273,7 @@ pub unsafe extern "C" fn candle_sd15_free_image(image: *mut CandleSd15Image) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn candle_sd15_last_error() -> *const c_char {
+pub unsafe extern "C" fn candle_sd_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| {
         if let Some(message) = slot.borrow().as_ref() {
             message.as_ptr()
@@ -283,20 +283,20 @@ pub unsafe extern "C" fn candle_sd15_last_error() -> *const c_char {
     })
 }
 
-fn initialise(asset_dir: &Path, use_metal: bool) -> Result<Sd15Bridge, CandleSd15StatusCode> {
+fn initialise(asset_dir: &Path, use_metal: bool) -> Result<Sd15Bridge, CandleSdStatusCode> {
     let layout = AssetLayout::new(asset_dir.to_path_buf())?;
     let device = if use_metal {
         #[cfg(feature = "metal")]
         {
             match Device::new_metal(0) {
                 Ok(d) => d,
-                Err(e) => return Err(set_error(CandleSd15StatusCode::MetalUnavailable, e)),
+                Err(e) => return Err(set_error(CandleSdStatusCode::MetalUnavailable, e)),
             }
         }
         #[cfg(not(feature = "metal"))]
         {
             return Err(set_error(
-                CandleSd15StatusCode::MetalUnavailable,
+                CandleSdStatusCode::MetalUnavailable,
                 "bridge compiled without Metal support",
             ));
         }
@@ -571,14 +571,14 @@ impl Sd15Bridge {
     }
 }
 
-fn c_string_to_path(ptr: *const c_char) -> Result<PathBuf, CandleSd15StatusCode> {
+fn c_string_to_path(ptr: *const c_char) -> Result<PathBuf, CandleSdStatusCode> {
     c_string_to_string(ptr).map(PathBuf::from)
 }
 
-fn c_string_to_string(ptr: *const c_char) -> Result<String, CandleSd15StatusCode> {
+fn c_string_to_string(ptr: *const c_char) -> Result<String, CandleSdStatusCode> {
     if ptr.is_null() {
         return Err(set_error(
-            CandleSd15StatusCode::InvalidArgument,
+            CandleSdStatusCode::InvalidArgument,
             "received null string pointer",
         ));
     }
@@ -586,13 +586,13 @@ fn c_string_to_string(ptr: *const c_char) -> Result<String, CandleSd15StatusCode
     match c_str.to_str() {
         Ok(s) => Ok(s.to_string()),
         Err(_) => Err(set_error(
-            CandleSd15StatusCode::InvalidArgument,
+            CandleSdStatusCode::InvalidArgument,
             "string was not valid UTF-8",
         )),
     }
 }
 
-fn set_error(code: CandleSd15StatusCode, message: impl std::fmt::Display) -> CandleSd15StatusCode {
+fn set_error(code: CandleSdStatusCode, message: impl std::fmt::Display) -> CandleSdStatusCode {
     let msg = message.to_string();
     let cstring =
         CString::new(msg).unwrap_or_else(|_| CString::new("error message contained nul").unwrap());
