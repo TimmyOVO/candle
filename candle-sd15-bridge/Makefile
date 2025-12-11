@@ -13,7 +13,7 @@ FEATURES_FLAG := $(if $(FEATURES),--features $(FEATURES),)
 all: xcframework
 
 $(TARGETS:%=build-%): build-%:
-	$(CARGO) build -p $(PACKAGE) --release $(FEATURES_FLAG) --target $*
+	IPHONEOS_DEPLOYMENT_TARGET=26.0 $(CARGO) build -p $(PACKAGE) --release $(FEATURES_FLAG) --target $*
 
 xcframework: $(TARGETS:%=build-%)
 	rm -rf $(OUTPUT)
